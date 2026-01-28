@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io'; 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img; 
 import 'package:smart_cccd/models/cccd_info.dart';
 import 'package:smart_cccd/services/camera_service.dart';
 import 'profile_screen.dart';
@@ -23,6 +25,8 @@ class _ScanScreenState extends State<ScanScreen> {
   final double overlayW = 230;
   final double overlayH = 230;
 
+  Size? _containerSize;
+
   @override
   void initState() {
     super.initState();
@@ -37,6 +41,9 @@ class _ScanScreenState extends State<ScanScreen> {
       }
       _controller = CameraController(cameras[0], ResolutionPreset.high);
       await _controller.initialize();
+      final maxZoom = await _controller.getMaxZoomLevel();
+      final zoomLevel = maxZoom > 2.0 ? 2.0 : maxZoom;  
+      await _controller.setZoomLevel(zoomLevel);
       if (!mounted) return;
       setState(() {
         _initialized = true;
@@ -48,7 +55,7 @@ class _ScanScreenState extends State<ScanScreen> {
 
   void _startScanning() {
     if (_timer != null) return;
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _timer = Timer.periodic(const Duration(milliseconds: 500), (timer) { 
       _onCapture();
     });
   }
@@ -59,12 +66,32 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   Future<void> _onCapture() async {
-    if (!_initialized || _isCapturing) return;
+    if (!_initialized || _isCapturing || _containerSize == null) return;
     _isCapturing = true;
     try {
       final XFile file = await _controller.takePicture();
 
-      final codes = await _cameraService.scanQrFromXFile(file);
+      final bytes = await file.readAsBytes();
+
+      final image = img.decodeImage(bytes);
+      if (image == null) return;
+
+      final croppedImage = _cropToOverlay(image);
+      if (croppedImage == null) return;
+
+      final grayscaleImage = img.grayscale(croppedImage);
+
+      final adjustedBytes = img.encodeJpg(grayscaleImage, quality: 80);  
+
+      final tempDir = Directory.systemTemp;
+      final tempFile = File('${tempDir.path}/adjusted_image.jpg');
+      await tempFile.writeAsBytes(adjustedBytes);
+      final adjustedXFile = XFile(tempFile.path);
+
+      final codes = await _cameraService.scanQrFromXFile(adjustedXFile);
+
+      await tempFile.delete();
+
 
       if (codes.isEmpty) {
         return;
@@ -112,6 +139,43 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
+  img.Image? _cropToOverlay(img.Image image) {
+    if (_containerSize == null) return null;
+
+    final containerWidth = _containerSize!.width;
+    final containerHeight = _containerSize!.height;
+
+    final previewSize = _controller.value.previewSize;
+    if (previewSize == null) return null;
+
+    final scaleX = containerWidth / previewSize.width;
+    final scaleY = containerHeight / previewSize.height;
+    final scale = scaleX < scaleY ? scaleX : scaleY; 
+
+    final offsetX = (containerWidth - previewSize.width * scale) / 2;
+    final offsetY = (containerHeight - previewSize.height * scale) / 2;
+
+    final overlayCenterX = containerWidth / 2;
+    final overlayCenterY = containerHeight / 2;
+
+    final previewCenterX = (overlayCenterX - offsetX) / scale;
+    final previewCenterY = (overlayCenterY - offsetY) / scale;
+    final previewWidthCrop = overlayW / scale;
+    final previewHeightCrop = overlayH / scale;
+
+    final imageScaleX = image.width / previewSize.width;
+    final imageScaleY = image.height / previewSize.height;
+
+    final imageLeft = ((previewCenterX - previewWidthCrop / 2) * imageScaleX).clamp(0, image.width.toDouble()).toInt();
+    final imageTop = ((previewCenterY - previewHeightCrop / 2) * imageScaleY).clamp(0, image.height.toDouble()).toInt();
+    final imageWidth = ((previewWidthCrop * imageScaleX).clamp(0, image.width - imageLeft).toInt());
+    final imageHeight = ((previewHeightCrop * imageScaleY).clamp(0, image.height - imageTop).toInt());
+
+    if (imageWidth <= 0 || imageHeight <= 0) return null;
+
+    return img.copyCrop(image, x: imageLeft, y: imageTop, width: imageWidth, height: imageHeight);
+  }
+
   @override
   void dispose() {
     _stopScanning();
@@ -134,6 +198,7 @@ class _ScanScreenState extends State<ScanScreen> {
           children: [
             Expanded(
               child: LayoutBuilder(builder: (context, constraints) {
+                _containerSize = Size(constraints.maxWidth, constraints.maxHeight);   
                 return Center(
                   child: Container(
                     key: _previewKey,
